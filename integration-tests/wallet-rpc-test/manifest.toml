@@ -1,0 +1,7 @@
+appId = "0xb2aa921c2ad67724d4621d2e622856a1"
+
+[appName]
+en = "wallet rpc test client"
+
+[permissions]
+"os/security" = ["SetSeedAndPin", "GetSeed"]

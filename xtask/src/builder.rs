@@ -900,6 +900,12 @@ pub fn get_crate_os_deps(crate_name: &str) -> Vec<String> {
     let os_dir = project_root().join("os");
     while let Some(crate_to_check) = crates_to_check.pop() {
         for dep in &get_package_metadata(&crate_to_check).dependencies {
+            // Optional dependencies are not part of the default build unless a
+            // feature pulls them in, so they must not be force-added as
+            // mandatory servers (they may not even have a matching -server crate).
+            if dep.optional {
+                continue;
+            }
             if dep.path.as_ref().is_some_and(|d| d.starts_with(&os_dir))
                 && !result.contains(&dep.name)
                 && !non_binary_crates.contains(&dep.name)

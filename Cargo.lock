@@ -12342,6 +12342,45 @@ dependencies = [
 ]
 
 [[package]]
+name = "wallet-rpc"
+version = "0.1.0"
+dependencies = [
+ "gui-server-api",
+ "log 0.4.27",
+ "ngwallet",
+ "rkyv",
+ "security",
+ "server",
+ "thiserror 1.0.64",
+ "usb",
+ "wallet-rpc-core",
+ "xous",
+ "xous-api-log",
+]
+
+[[package]]
+name = "wallet-rpc-core"
+version = "0.1.0"
+dependencies = [
+ "ngwallet",
+ "thiserror 1.0.64",
+]
+
+[[package]]
+name = "wallet-rpc-test"
+version = "0.1.0"
+dependencies = [
+ "keyos-integration-test",
+ "log 0.4.27",
+ "ngwallet",
+ "security",
+ "server",
+ "wallet-rpc-core",
+ "xous-api-log",
+ "xous-ipc",
+]
+
+[[package]]
 name = "wasi"
 version = "0.9.0+wasi-snapshot-preview1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1,0 +1,32 @@
+# SPDX-FileCopyrightText: 2026 Foundation Devices, Inc. <hello@foundation.xyz>
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+[package]
+name = "wallet-rpc"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["gui-approval", "hardware"]
+# On-device approval via a GUI alert. Disable (and enable test-approval) for
+# headless hosted integration tests, which have no GUI server.
+gui-approval = ["dep:gui-server-api"]
+# The USB HID transport (device-only). Off for host/hosted builds.
+hardware = ["dep:usb"]
+test-approval = []
+
+[dependencies]
+gui-server-api = { workspace = true, optional = true }
+log = "0.4.14"
+log-server = { package = "xous-api-log", path = "../../xous/api/log" }
+ngwallet = { workspace = true }
+rkyv = { workspace = true }
+security = { workspace = true }
+server = { path = "../../server" }
+thiserror = "1.0"
+usb = { workspace = true, optional = true }
+wallet-rpc-core = { path = "../wallet-rpc-core" }
+xous = { path = "../../xous/xous-rs" }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(keyos)'] }

@@ -1,0 +1,19 @@
+appId = "0xab896a3044253d9da49f1bcc6499aaf9"
+
+[appName]
+en = "Wallet RPC Server"
+
+[servers."os/wallet-rpc"]
+ProcessRpcFrame = { id = 0, type = "archive" }
+
+[permissions]
+"os/security" = ["GetSeed"]
+"os/gui-server" = ["ShowModal"]
+"os/usbdev" = [
+    "ReadEndpoint",
+    "WriteEndpoint",
+    "NumInterfaces",
+    "RegisterSetupResponder",
+    "RegisterInterface",
+    "WaitForConnection",
+]

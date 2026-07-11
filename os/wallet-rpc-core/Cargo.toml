@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: 2026 Foundation Devices, Inc. <hello@foundation.xyz>
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+[package]
+name = "wallet-rpc-core"
+version = "0.1.0"
+edition = "2021"
+
+# Pure coinjoin remote-signing logic: wire protocol, SLIP-0019 proofs, coinjoin
+# policy + signing, USB framing. No KeyOS server, USB, or GUI dependencies, so it
+# builds and unit-tests on the host and is reusable by hosted integration tests.
+
+[dependencies]
+ngwallet = { workspace = true }
+thiserror = "1.0"

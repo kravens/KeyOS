@@ -1,0 +1,18 @@
+# SPDX-FileCopyrightText: 2026 Foundation Devices, Inc. <hello@foundation.xyz>
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+[package]
+name = "wallet-rpc-test"
+version = "0.1.0"
+edition = "2021"
+description = "Wallet RPC core + security-server integration test"
+
+[dependencies]
+keyos-integration-test = { path = "../keyos-integration-test" }
+log = { workspace = true }
+log-server = { workspace = true }
+ngwallet = { workspace = true }
+security = { workspace = true }
+server = { workspace = true }
+wallet-rpc-core = { path = "../../os/wallet-rpc-core" }
+xous-ipc = { workspace = true }
