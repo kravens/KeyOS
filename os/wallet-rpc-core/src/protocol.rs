@@ -24,7 +24,7 @@
 //! without any KeyOS servers.
 
 use ngwallet::bdk_wallet::bitcoin::{
-    bip32::{ChildNumber, DerivationPath, Xpriv},
+    bip32::{ChildNumber, DerivationPath, Fingerprint, Xpriv, Xpub},
     secp256k1::{All, Secp256k1},
     Network,
 };
@@ -59,6 +59,30 @@ pub const CAPABILITIES: u32 = CAP_OWNERSHIP_PROOFS | CAP_COINJOIN_SIGNING;
 
 const REQUEST_HEADER_LEN: usize = 4;
 
+/// Error from a typed engine operation, independent of any transport.
+/// The byte protocol maps these to a wire status byte; a QuantumLink message
+/// handler can map them to its own error type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoreError {
+    Malformed,
+    Denied,
+    NoSession,
+    Policy,
+    Internal,
+}
+
+impl CoreError {
+    pub fn status(self) -> u8 {
+        match self {
+            CoreError::Malformed => STATUS_ERR_MALFORMED,
+            CoreError::Denied => STATUS_ERR_DENIED,
+            CoreError::NoSession => STATUS_ERR_NO_SESSION,
+            CoreError::Policy => STATUS_ERR_POLICY,
+            CoreError::Internal => STATUS_ERR_INTERNAL,
+        }
+    }
+}
+
 /// Host-independent device services the protocol needs.
 pub trait Backend {
     fn firmware_version(&self) -> String;
@@ -81,6 +105,109 @@ impl<B: Backend> Engine<B> {
         Self { backend, secp: Secp256k1::new(), sessions: Vec::new(), next_session_id: 1 }
     }
 
+    // ------------------------------------------------------------------
+    // Typed API — transport-independent. Both the byte protocol below and a
+    // QuantumLink message handler call these directly.
+    // ------------------------------------------------------------------
+
+    /// `(protocol_version, capabilities, firmware_version)`.
+    pub fn info(&self) -> (u8, u32, String) {
+        (PROTOCOL_VERSION, CAPABILITIES, self.backend.firmware_version())
+    }
+
+    /// Extended public key at `path` (for wallet import). One seed prompt.
+    pub fn xpub(&mut self, network: Network, path: &[u32]) -> Result<(Fingerprint, String), CoreError> {
+        let seed = self.backend.seed().ok_or(CoreError::Denied)?;
+        let master = Xpriv::new_master(network, &seed).map_err(|_| CoreError::Internal)?;
+        let fingerprint = master.fingerprint(&self.secp);
+        let derivation: DerivationPath =
+            path.iter().map(|&i| ChildNumber::from(i)).collect::<Vec<_>>().into();
+        let xpriv = master.derive_priv(&self.secp, &derivation).map_err(|_| CoreError::Internal)?;
+        Ok((fingerprint, Xpub::from_priv(&self.secp, &xpriv).to_string()))
+    }
+
+    /// Approve a coinjoin session on-device and open it. Retrieves the seed
+    /// once, here, right after the single approval, and caches it for the
+    /// session — so later proofs and signatures never re-prompt. Returns the
+    /// session id.
+    pub fn authorize(&mut self, policy: Policy) -> Result<u32, CoreError> {
+        if !self.backend.approve_policy(&policy) {
+            return Err(CoreError::Denied);
+        }
+        let seed = self.backend.seed().ok_or(CoreError::Denied)?;
+        let id = self.next_session_id;
+        self.next_session_id = self.next_session_id.wrapping_add(1);
+        self.sessions.push(Session {
+            id,
+            policy,
+            authorized_at: std::time::Instant::now(),
+            rounds_used: 0,
+            seed: zeroize::Zeroizing::new(seed),
+        });
+        Ok(id)
+    }
+
+    /// SLIP-0019 ownership proof for `path` under an authorized session. The
+    /// path must be in the policy account and the commitment must open with the
+    /// authorized coordinator id.
+    pub fn ownership_proof(
+        &mut self,
+        session_id: u32,
+        path: &[u32],
+        commitment: &[u8],
+    ) -> Result<Vec<u8>, CoreError> {
+        let session = self.session(session_id)?;
+        if session.is_expired() {
+            return Err(CoreError::NoSession);
+        }
+        if !session.policy.path_in_scope(path) {
+            return Err(CoreError::Policy);
+        }
+        if !commitment_matches_coordinator(commitment, &session.policy.coordinator_id) {
+            return Err(CoreError::Policy);
+        }
+        // Uses the session's cached seed — no per-round trusted-display prompt.
+        slip19::ownership_proof(&self.secp, &session.seed, session.policy.network, path, commitment, true)
+            .map_err(|_| CoreError::Internal)
+    }
+
+    /// Verify the round PSBT against the session policy and sign our inputs.
+    pub fn sign_round(&mut self, session_id: u32, psbt: &[u8]) -> Result<Vec<u8>, CoreError> {
+        let session = self.session(session_id)?;
+        let signed = coinjoin::check_and_sign(&self.secp, session, psbt).map_err(|e| match e {
+            coinjoin::CoinjoinError::SessionExpired => CoreError::NoSession,
+            coinjoin::CoinjoinError::MalformedPsbt => CoreError::Malformed,
+            _ => CoreError::Policy,
+        })?;
+        // A signature spends one round of the session budget.
+        self.session_mut(session_id)?.rounds_used += 1;
+        Ok(signed.psbt_bytes)
+    }
+
+    /// Revoke a session, disabling further signing under it.
+    pub fn revoke(&mut self, session_id: u32) -> Result<(), CoreError> {
+        let before = self.sessions.len();
+        self.sessions.retain(|s| s.id != session_id);
+        if self.sessions.len() == before {
+            return Err(CoreError::NoSession);
+        }
+        Ok(())
+    }
+
+    fn session(&self, id: u32) -> Result<&Session, CoreError> {
+        self.sessions.iter().find(|s| s.id == id).ok_or(CoreError::NoSession)
+    }
+
+    fn session_mut(&mut self, id: u32) -> Result<&mut Session, CoreError> {
+        self.sessions.iter_mut().find(|s| s.id == id).ok_or(CoreError::NoSession)
+    }
+
+    // ------------------------------------------------------------------
+    // Byte protocol adapter — the USB / test transport. Parses a frame,
+    // calls the typed API, serializes the result. A QuantumLink app does not
+    // use this; it calls the typed methods above with decoded messages.
+    // ------------------------------------------------------------------
+
     /// Process one request frame, producing the response frame.
     pub fn process_frame(&mut self, frame: &[u8]) -> Vec<u8> {
         if frame.len() < REQUEST_HEADER_LEN {
@@ -99,12 +226,12 @@ impl<B: Backend> Engine<B> {
         let payload = &frame[REQUEST_HEADER_LEN..];
 
         let result = match command {
-            CMD_GET_INFO => self.get_info(),
-            CMD_GET_XPUB => self.get_xpub(payload),
-            CMD_GET_OWNERSHIP_PROOF => self.get_ownership_proof(payload),
-            CMD_AUTHORIZE_COINJOIN => self.authorize_coinjoin(payload),
-            CMD_SIGN_COINJOIN => self.sign_coinjoin(payload),
-            CMD_REVOKE_SESSION => self.revoke_session(payload),
+            CMD_GET_INFO => Ok(self.info_bytes()),
+            CMD_GET_XPUB => self.xpub_bytes(payload),
+            CMD_GET_OWNERSHIP_PROOF => self.ownership_proof_bytes(payload),
+            CMD_AUTHORIZE_COINJOIN => self.authorize_bytes(payload),
+            CMD_SIGN_COINJOIN => self.sign_bytes(payload),
+            CMD_REVOKE_SESSION => self.revoke_bytes(payload),
             _ => Err(STATUS_ERR_UNKNOWN_COMMAND),
         };
 
@@ -114,126 +241,58 @@ impl<B: Backend> Engine<B> {
         }
     }
 
-    fn get_info(&mut self) -> Result<Vec<u8>, u8> {
-        let fw = self.backend.firmware_version();
+    fn info_bytes(&self) -> Vec<u8> {
+        let (ver, caps, fw) = self.info();
         let mut payload = Vec::with_capacity(5 + fw.len());
-        payload.push(PROTOCOL_VERSION);
-        payload.extend_from_slice(&CAPABILITIES.to_le_bytes());
+        payload.push(ver);
+        payload.extend_from_slice(&caps.to_le_bytes());
         payload.extend_from_slice(fw.as_bytes());
-        Ok(payload)
+        payload
     }
 
-    fn get_xpub(&mut self, payload: &[u8]) -> Result<Vec<u8>, u8> {
+    fn xpub_bytes(&mut self, payload: &[u8]) -> Result<Vec<u8>, u8> {
         let (network, rest) = parse_network(payload)?;
         let (path, rest) = parse_path(rest)?;
         if !rest.is_empty() {
             return Err(STATUS_ERR_MALFORMED);
         }
-
-        let seed = self.backend.seed().ok_or(STATUS_ERR_DENIED)?;
-        let master = Xpriv::new_master(network, &seed).map_err(|_| STATUS_ERR_INTERNAL)?;
-        let fingerprint = master.fingerprint(&self.secp);
-        let derivation: DerivationPath =
-            path.iter().map(|&i| ChildNumber::from(i)).collect::<Vec<_>>().into();
-        let xpriv = master.derive_priv(&self.secp, &derivation).map_err(|_| STATUS_ERR_INTERNAL)?;
-        let xpub =
-            ngwallet::bdk_wallet::bitcoin::bip32::Xpub::from_priv(&self.secp, &xpriv).to_string();
-
+        let (fingerprint, xpub) = self.xpub(network, &path).map_err(CoreError::status)?;
         let mut out = Vec::with_capacity(4 + xpub.len());
         out.extend_from_slice(fingerprint.as_bytes());
         out.extend_from_slice(xpub.as_bytes());
         Ok(out)
     }
 
-    fn get_ownership_proof(&mut self, payload: &[u8]) -> Result<Vec<u8>, u8> {
+    fn ownership_proof_bytes(&mut self, payload: &[u8]) -> Result<Vec<u8>, u8> {
         let (session_id, rest) = parse_u32(payload)?;
         let (path, rest) = parse_path(rest)?;
         let (commitment, rest) = parse_prefixed_u16(rest)?;
         if !rest.is_empty() {
             return Err(STATUS_ERR_MALFORMED);
         }
-
-        let session = self.session(session_id)?;
-        if session.is_expired() {
-            return Err(STATUS_ERR_NO_SESSION);
-        }
-        if !session.policy.path_in_scope(&path) {
-            return Err(STATUS_ERR_POLICY);
-        }
-        // The commitment is `varint(len(coordinator_id)) || coordinator_id || round_id`
-        // (Wasabi CoinJoinInputCommitmentData). Only the authorized coordinator may
-        // be committed to.
-        if !commitment_matches_coordinator(&commitment, &session.policy.coordinator_id) {
-            return Err(STATUS_ERR_POLICY);
-        }
-        // Uses the session's cached seed — no per-round trusted-display prompt.
-        slip19::ownership_proof(&self.secp, &session.seed, session.policy.network, &path, &commitment, true)
-            .map_err(|_| STATUS_ERR_INTERNAL)
+        self.ownership_proof(session_id, &path, &commitment).map_err(CoreError::status)
     }
 
-    fn authorize_coinjoin(&mut self, payload: &[u8]) -> Result<Vec<u8>, u8> {
+    fn authorize_bytes(&mut self, payload: &[u8]) -> Result<Vec<u8>, u8> {
         let (policy, consumed) = Policy::parse(payload).ok_or(STATUS_ERR_MALFORMED)?;
         if consumed != payload.len() {
             return Err(STATUS_ERR_MALFORMED);
         }
-        if !self.backend.approve_policy(&policy) {
-            return Err(STATUS_ERR_DENIED);
-        }
-
-        // Retrieve the seed once, here, right after the single on-device approval,
-        // and cache it in the session. Per-round proofs and signatures then use
-        // the cached seed, so the user is prompted exactly once per session.
-        let seed = self.backend.seed().ok_or(STATUS_ERR_DENIED)?;
-
-        let id = self.next_session_id;
-        self.next_session_id = self.next_session_id.wrapping_add(1);
-        self.sessions.push(Session {
-            id,
-            policy,
-            authorized_at: std::time::Instant::now(),
-            rounds_used: 0,
-            seed: zeroize::Zeroizing::new(seed),
-        });
-        // ponytail: sessions live in memory only — a reboot clears them (and
-        // zeroizes the cached seed), which is the conservative default.
+        let id = self.authorize(policy).map_err(CoreError::status)?;
         Ok(id.to_le_bytes().to_vec())
     }
 
-    fn sign_coinjoin(&mut self, payload: &[u8]) -> Result<Vec<u8>, u8> {
-        let (session_id, psbt_bytes) = parse_u32(payload)?;
-
-        let session = self.session(session_id)?;
-        let signed = coinjoin::check_and_sign(&self.secp, session, psbt_bytes)
-            .map_err(|e| match e {
-                coinjoin::CoinjoinError::SessionExpired => STATUS_ERR_NO_SESSION,
-                coinjoin::CoinjoinError::MalformedPsbt => STATUS_ERR_MALFORMED,
-                _ => STATUS_ERR_POLICY,
-            })?;
-
-        // A signature spends one round of the session budget.
-        self.session_mut(session_id)?.rounds_used += 1;
-        Ok(signed.psbt_bytes)
+    fn sign_bytes(&mut self, payload: &[u8]) -> Result<Vec<u8>, u8> {
+        let (session_id, psbt) = parse_u32(payload)?;
+        self.sign_round(session_id, psbt).map_err(CoreError::status)
     }
 
-    fn revoke_session(&mut self, payload: &[u8]) -> Result<Vec<u8>, u8> {
+    fn revoke_bytes(&mut self, payload: &[u8]) -> Result<Vec<u8>, u8> {
         let (session_id, rest) = parse_u32(payload)?;
         if !rest.is_empty() {
             return Err(STATUS_ERR_MALFORMED);
         }
-        let before = self.sessions.len();
-        self.sessions.retain(|s| s.id != session_id);
-        if self.sessions.len() == before {
-            return Err(STATUS_ERR_NO_SESSION);
-        }
-        Ok(vec![])
-    }
-
-    fn session(&self, id: u32) -> Result<&Session, u8> {
-        self.sessions.iter().find(|s| s.id == id).ok_or(STATUS_ERR_NO_SESSION)
-    }
-
-    fn session_mut(&mut self, id: u32) -> Result<&mut Session, u8> {
-        self.sessions.iter_mut().find(|s| s.id == id).ok_or(STATUS_ERR_NO_SESSION)
+        self.revoke(session_id).map(|_| vec![]).map_err(CoreError::status)
     }
 }
 
@@ -325,6 +384,60 @@ mod tests {
     }
 
     fn engine(approve: bool) -> Engine<MockBackend> { Engine::new(MockBackend { approve }) }
+
+    fn test_policy() -> Policy {
+        Policy {
+            network: Network::Bitcoin,
+            account: 0,
+            coordinator_id: b"CoinJoinCoordinatorIdentifier".to_vec(),
+            max_fee_contribution: 10_000,
+            max_rounds: 5,
+            valid_for_secs: 3600,
+        }
+    }
+
+    /// The typed API (what a QuantumLink message handler calls) end to end,
+    /// no byte framing involved.
+    #[test]
+    fn typed_api_flow() {
+        const H: u32 = 0x8000_0000;
+        let mut engine = engine(true);
+
+        let (ver, caps, _fw) = engine.info();
+        assert_eq!(ver, PROTOCOL_VERSION);
+        assert_eq!(caps & 0b11, 0b11);
+
+        let (fp, xpub) = engine.xpub(Network::Bitcoin, &[84 | H, H, H]).unwrap();
+        assert_eq!(fp.as_bytes(), &[0x5c, 0x9e, 0x22, 0x8d]);
+        assert!(xpub.starts_with("xpub"));
+
+        let session = engine.authorize(test_policy()).unwrap();
+
+        // Ownership proof for the authorized coordinator succeeds; a foreign one is rejected.
+        let coordinator = b"CoinJoinCoordinatorIdentifier";
+        let mut commitment = vec![coordinator.len() as u8];
+        commitment.extend_from_slice(coordinator);
+        commitment.extend_from_slice(&[0xab; 32]);
+        let proof = engine.ownership_proof(session, &[84 | H, H, H, 1, 0], &commitment).unwrap();
+        assert_eq!(&proof[..4], &[0x53, 0x4c, 0x00, 0x19]);
+
+        let mut evil = vec![4u8];
+        evil.extend_from_slice(b"Evil");
+        evil.extend_from_slice(&[0xab; 32]);
+        assert_eq!(
+            engine.ownership_proof(session, &[84 | H, H, H, 1, 0], &evil),
+            Err(CoreError::Policy)
+        );
+
+        // Revoke, then the session is gone.
+        engine.revoke(session).unwrap();
+        assert_eq!(engine.revoke(session), Err(CoreError::NoSession));
+    }
+
+    #[test]
+    fn typed_authorize_denied() {
+        assert_eq!(engine(false).authorize(test_policy()), Err(CoreError::Denied));
+    }
 
     fn frame(cmd: u8, payload: &[u8]) -> Vec<u8> {
         let mut f = vec![PROTOCOL_VERSION, cmd];
