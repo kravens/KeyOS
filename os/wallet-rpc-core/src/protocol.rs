@@ -166,10 +166,8 @@ impl<B: Backend> Engine<B> {
         if !commitment_matches_coordinator(&commitment, &session.policy.coordinator_id) {
             return Err(STATUS_ERR_POLICY);
         }
-        let network = session.policy.network;
-
-        let seed = self.backend.seed().ok_or(STATUS_ERR_DENIED)?;
-        slip19::ownership_proof(&self.secp, &seed, network, &path, &commitment, true)
+        // Uses the session's cached seed — no per-round trusted-display prompt.
+        slip19::ownership_proof(&self.secp, &session.seed, session.policy.network, &path, &commitment, true)
             .map_err(|_| STATUS_ERR_INTERNAL)
     }
 
@@ -182,6 +180,11 @@ impl<B: Backend> Engine<B> {
             return Err(STATUS_ERR_DENIED);
         }
 
+        // Retrieve the seed once, here, right after the single on-device approval,
+        // and cache it in the session. Per-round proofs and signatures then use
+        // the cached seed, so the user is prompted exactly once per session.
+        let seed = self.backend.seed().ok_or(STATUS_ERR_DENIED)?;
+
         let id = self.next_session_id;
         self.next_session_id = self.next_session_id.wrapping_add(1);
         self.sessions.push(Session {
@@ -189,18 +192,18 @@ impl<B: Backend> Engine<B> {
             policy,
             authorized_at: std::time::Instant::now(),
             rounds_used: 0,
+            seed: zeroize::Zeroizing::new(seed),
         });
-        // ponytail: sessions live in memory only — a reboot clears them, which is
-        // the conservative default for a signing device.
+        // ponytail: sessions live in memory only — a reboot clears them (and
+        // zeroizes the cached seed), which is the conservative default.
         Ok(id.to_le_bytes().to_vec())
     }
 
     fn sign_coinjoin(&mut self, payload: &[u8]) -> Result<Vec<u8>, u8> {
         let (session_id, psbt_bytes) = parse_u32(payload)?;
-        let seed = self.backend.seed().ok_or(STATUS_ERR_DENIED)?;
 
         let session = self.session(session_id)?;
-        let signed = coinjoin::check_and_sign(&self.secp, &seed, session, psbt_bytes)
+        let signed = coinjoin::check_and_sign(&self.secp, session, psbt_bytes)
             .map_err(|e| match e {
                 coinjoin::CoinjoinError::SessionExpired => STATUS_ERR_NO_SESSION,
                 coinjoin::CoinjoinError::MalformedPsbt => STATUS_ERR_MALFORMED,

@@ -22,6 +22,7 @@ use ngwallet::bdk_wallet::bitcoin::{
     sighash::SighashCache,
     Amount, CompressedPublicKey, EcdsaSighashType, Network, ScriptBuf, Witness,
 };
+use zeroize::Zeroizing;
 
 /// Purpose level of the BIP-84 account the policy covers.
 const PURPOSE: u32 = 84;
@@ -118,6 +119,13 @@ pub struct Session {
     pub policy: Policy,
     pub authorized_at: Instant,
     pub rounds_used: u16,
+    /// The BIP-39 seed, retrieved once at authorization and cached for the
+    /// session. Keeping it here means ownership proofs and signatures don't
+    /// re-fetch the seed each round — on Passport that would prompt the user on
+    /// the trusted display every round (secure-element seed retrieval is gated
+    /// per-op); with the session cache there is exactly one prompt, at authorize.
+    /// Zeroized when the session is dropped (revoke / expiry / reboot).
+    pub seed: Zeroizing<Vec<u8>>,
 }
 
 impl Session {
@@ -168,7 +176,6 @@ pub struct SignedRound {
 /// lose no matter what the rest of the transaction looks like.
 pub fn check_and_sign(
     secp: &Secp256k1<All>,
-    seed: &[u8],
     session: &Session,
     psbt_bytes: &[u8],
 ) -> Result<SignedRound, CoinjoinError> {
@@ -178,7 +185,8 @@ pub fn check_and_sign(
     let policy = &session.policy;
 
     let mut psbt = Psbt::deserialize(psbt_bytes).map_err(|_| CoinjoinError::MalformedPsbt)?;
-    let master = Xpriv::new_master(policy.network, seed).map_err(|_| CoinjoinError::Derivation)?;
+    let master =
+        Xpriv::new_master(policy.network, &session.seed).map_err(|_| CoinjoinError::Derivation)?;
     let fingerprint = master.fingerprint(secp);
 
     // Classify inputs.
@@ -312,7 +320,13 @@ mod tests {
     }
 
     fn session() -> Session {
-        Session { id: 1, policy: policy(), authorized_at: Instant::now(), rounds_used: 0 }
+        Session {
+            id: 1,
+            policy: policy(),
+            authorized_at: Instant::now(),
+            rounds_used: 0,
+            seed: Zeroizing::new(seed()),
+        }
     }
 
     /// Coinjoin-shaped PSBT: our input (m/84'/0'/0'/0/0), a foreign input,
@@ -383,7 +397,7 @@ mod tests {
     fn conforming_round_signs_our_input_only() {
         let secp = Secp256k1::new();
         let psbt = fixture_psbt(&secp, 100_000, 95_000, &[84 | H, H, H, 1, 0]);
-        let signed = check_and_sign(&secp, &seed(), &session(), &psbt.serialize()).unwrap();
+        let signed = check_and_sign(&secp, &session(), &psbt.serialize()).unwrap();
         assert_eq!(signed.our_inputs, vec![0]);
 
         let out = Psbt::deserialize(&signed.psbt_bytes).unwrap();
@@ -397,7 +411,7 @@ mod tests {
         let secp = Secp256k1::new();
         // 100k in, 80k back: 20k contribution > 10k cap
         let psbt = fixture_psbt(&secp, 100_000, 80_000, &[84 | H, H, H, 1, 0]);
-        let err = check_and_sign(&secp, &seed(), &session(), &psbt.serialize()).unwrap_err();
+        let err = check_and_sign(&secp, &session(), &psbt.serialize()).unwrap_err();
         assert_eq!(err, CoinjoinError::FeeExceeded { actual: 20_000, max: 10_000 });
     }
 
@@ -407,7 +421,7 @@ mod tests {
         // "our" output claims account 1 — out of policy scope, so not credited:
         // contribution = full 100k > cap.
         let psbt = fixture_psbt(&secp, 100_000, 95_000, &[84 | H, 1 | H, 1 | H, 1, 0]);
-        let err = check_and_sign(&secp, &seed(), &session(), &psbt.serialize()).unwrap_err();
+        let err = check_and_sign(&secp, &session(), &psbt.serialize()).unwrap_err();
         assert!(matches!(err, CoinjoinError::FeeExceeded { .. }));
     }
 
@@ -426,7 +440,7 @@ mod tests {
                 vec![ChildNumber::from(84 | H), ChildNumber::from(H), ChildNumber::from(H), ChildNumber::from(1), ChildNumber::from(5)].into(),
             ),
         );
-        let err = check_and_sign(&secp, &seed(), &session(), &psbt.serialize()).unwrap_err();
+        let err = check_and_sign(&secp, &session(), &psbt.serialize()).unwrap_err();
         assert_eq!(err, CoinjoinError::OutputKeyMismatch(1));
     }
 
@@ -436,7 +450,7 @@ mod tests {
         let psbt = fixture_psbt(&secp, 100_000, 95_000, &[84 | H, H, H, 1, 0]);
         let mut session = session();
         session.authorized_at = Instant::now() - Duration::from_secs(7200);
-        let err = check_and_sign(&secp, &seed(), &session, &psbt.serialize()).unwrap_err();
+        let err = check_and_sign(&secp, &session, &psbt.serialize()).unwrap_err();
         assert_eq!(err, CoinjoinError::SessionExpired);
     }
 
@@ -446,7 +460,7 @@ mod tests {
         let psbt = fixture_psbt(&secp, 100_000, 95_000, &[84 | H, H, H, 1, 0]);
         let mut session = session();
         session.rounds_used = session.policy.max_rounds;
-        let err = check_and_sign(&secp, &seed(), &session, &psbt.serialize()).unwrap_err();
+        let err = check_and_sign(&secp, &session, &psbt.serialize()).unwrap_err();
         assert_eq!(err, CoinjoinError::SessionExpired);
     }
 

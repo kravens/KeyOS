@@ -12364,6 +12364,7 @@ version = "0.1.0"
 dependencies = [
  "ngwallet",
  "thiserror 1.0.64",
+ "zeroize",
 ]
 
 [[package]]

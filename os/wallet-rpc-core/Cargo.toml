@@ -13,3 +13,4 @@ edition = "2021"
 [dependencies]
 ngwallet = { workspace = true }
 thiserror = "1.0"
+zeroize = "1"
