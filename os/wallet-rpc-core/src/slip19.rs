@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Foundation Devices, Inc. <hello@foundation.xyz>
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! SLIP-0019 proof of ownership (P2WPKH), Trezor-compatible.
+//! SLIP-0019 proof of ownership (P2WPKH + P2TR), Trezor-compatible.
 //!
 //! `proof = proofBody || bip322Signature` where
 //! `proofBody = 0x534c0019 || flags || varint(n) || ownership_id * n` and the
@@ -10,14 +10,28 @@
 //! `HMAC-SHA256(k, spk)` with `k` the SLIP-0021 node
 //! `m/"SLIP-0019"/"Ownership identification key"` of the BIP-0039 seed.
 //!
+//! P2WPKH signs the digest with ECDSA (witness `[der_sig || 0x01, pubkey]`);
+//! P2TR key-spends with the BIP-86 tweaked key (witness `[64-byte schnorr]`,
+//! SIGHASH_DEFAULT so no trailing sighash byte).
+//!
 //! Purely functional: seed in, proof out. No KeyOS server dependencies.
 
 use ngwallet::bdk_wallet::bitcoin::{
     bip32::{ChildNumber, DerivationPath, Xpriv},
     hashes::{hmac::HmacEngine, sha256, sha512, Hash, HashEngine, Hmac},
+    key::{Keypair, TapTweak, XOnlyPublicKey},
     secp256k1::{All, Message, Secp256k1},
     CompressedPublicKey, Network,
 };
+
+/// Script type of the input a proof is requested for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScriptType {
+    /// Segwit v0 pay-to-witness-pubkey-hash (BIP-84 keys).
+    P2wpkh,
+    /// Taproot key-spend with the BIP-86 tweak (BIP-86 keys).
+    P2tr,
+}
 
 pub const FLAG_USER_CONFIRMATION: u8 = 0x01;
 const VERSION_MAGIC: [u8; 4] = [0x53, 0x4c, 0x00, 0x19];
@@ -80,6 +94,8 @@ pub fn ownership_id(seed: &[u8], script_pubkey: &[u8]) -> [u8; 32] {
 }
 
 /// Generate a SLIP-0019 ownership proof for the P2WPKH key at `path`.
+/// (Kept for existing callers; equivalent to [`ownership_proof_for`] with
+/// [`ScriptType::P2wpkh`].)
 pub fn ownership_proof(
     secp: &Secp256k1<All>,
     seed: &[u8],
@@ -88,16 +104,54 @@ pub fn ownership_proof(
     commitment_data: &[u8],
     user_confirmation: bool,
 ) -> Result<Vec<u8>, Slip19Error> {
+    ownership_proof_for(
+        secp,
+        seed,
+        network,
+        ScriptType::P2wpkh,
+        path,
+        commitment_data,
+        user_confirmation,
+    )
+}
+
+/// Generate a SLIP-0019 ownership proof for the key at `path`.
+#[allow(clippy::too_many_arguments)]
+pub fn ownership_proof_for(
+    secp: &Secp256k1<All>,
+    seed: &[u8],
+    network: Network,
+    script_type: ScriptType,
+    path: &[u32],
+    commitment_data: &[u8],
+    user_confirmation: bool,
+) -> Result<Vec<u8>, Slip19Error> {
     let derivation: DerivationPath =
         path.iter().map(|&i| ChildNumber::from(i)).collect::<Vec<_>>().into();
     let xpriv = Xpriv::new_master(network, seed)?.derive_priv(secp, &derivation)?;
-    let pubkey = CompressedPublicKey(xpriv.private_key.public_key(secp));
 
-    // P2WPKH scriptPubKey: OP_0 PUSH20 <hash160(pubkey)>
-    let mut spk = Vec::with_capacity(22);
-    spk.push(0x00);
-    spk.push(0x14);
-    spk.extend_from_slice(pubkey.wpubkey_hash().as_byte_array());
+    let spk = match script_type {
+        ScriptType::P2wpkh => {
+            // P2WPKH scriptPubKey: OP_0 PUSH20 <hash160(pubkey)>
+            let pubkey = CompressedPublicKey(xpriv.private_key.public_key(secp));
+            let mut spk = Vec::with_capacity(22);
+            spk.push(0x00);
+            spk.push(0x14);
+            spk.extend_from_slice(pubkey.wpubkey_hash().as_byte_array());
+            spk
+        }
+        ScriptType::P2tr => {
+            // P2TR scriptPubKey: OP_1 PUSH32 <xonly(BIP-86 tweaked key)>
+            let keypair = Keypair::from_secret_key(secp, &xpriv.private_key);
+            let (tweaked_xonly, _) =
+                XOnlyPublicKey::from_keypair(&keypair.tap_tweak(secp, None).to_keypair());
+            let mut spk = Vec::with_capacity(34);
+            spk.push(0x51);
+            spk.push(0x20);
+            spk.extend_from_slice(&tweaked_xonly.serialize());
+            spk
+        }
+    };
 
     // Proof body
     let mut proof = Vec::new();
@@ -113,19 +167,33 @@ pub fn ownership_proof(
     push_varint(commitment_data.len() as u64, &mut preimage);
     preimage.extend_from_slice(commitment_data);
     let sighash = sha256::Hash::hash(&preimage);
+    let msg = Message::from_digest(sighash.to_byte_array());
 
-    // BIP-322 "simple" signature for P2WPKH: empty scriptSig + standard witness.
-    let signature =
-        secp.sign_ecdsa(&Message::from_digest(sighash.to_byte_array()), &xpriv.private_key);
-    let mut der = signature.serialize_der().to_vec();
-    der.push(0x01); // SIGHASH_ALL
-
+    // BIP-322 "simple" signature: empty scriptSig + the script type's witness.
     proof.push(0x00); // empty scriptSig
-    push_varint(2, &mut proof); // witness stack: [signature, pubkey]
-    push_varint(der.len() as u64, &mut proof);
-    proof.extend_from_slice(&der);
-    push_varint(33, &mut proof);
-    proof.extend_from_slice(&pubkey.to_bytes());
+    match script_type {
+        ScriptType::P2wpkh => {
+            // witness stack: [der_sig || SIGHASH_ALL, pubkey]
+            let pubkey = CompressedPublicKey(xpriv.private_key.public_key(secp));
+            let signature = secp.sign_ecdsa(&msg, &xpriv.private_key);
+            let mut der = signature.serialize_der().to_vec();
+            der.push(0x01); // SIGHASH_ALL
+            push_varint(2, &mut proof);
+            push_varint(der.len() as u64, &mut proof);
+            proof.extend_from_slice(&der);
+            push_varint(33, &mut proof);
+            proof.extend_from_slice(&pubkey.to_bytes());
+        }
+        ScriptType::P2tr => {
+            // witness stack: [64-byte schnorr sig] (SIGHASH_DEFAULT, no sighash byte)
+            let keypair = Keypair::from_secret_key(secp, &xpriv.private_key);
+            let tweaked = keypair.tap_tweak(secp, None).to_keypair();
+            let signature = secp.sign_schnorr_no_aux_rand(&msg, &tweaked);
+            push_varint(1, &mut proof);
+            push_varint(64, &mut proof);
+            proof.extend_from_slice(signature.as_ref());
+        }
+    }
 
     Ok(proof)
 }
@@ -176,6 +244,51 @@ mod tests {
                  18c8f6aaa0adec0199c69901f0db7d3485eb38d9ad235221dc3d61154b"
             ),
         );
+    }
+
+    #[test]
+    fn p2tr_spk_matches_bip86_vector() {
+        // BIP-86 test vector: "abandon ... about" seed, m/86'/0'/0'/0/0,
+        // tweaked output key a60869f0...49dc684c.
+        let secp = Secp256k1::new();
+        let seed = Mnemonic::parse(
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+        )
+        .unwrap()
+        .to_seed("");
+        let proof = ownership_proof_for(
+            &secp,
+            &seed,
+            Network::Bitcoin,
+            ScriptType::P2tr,
+            &[86 | H, H, H, 0, 0],
+            &[],
+            false,
+        )
+        .unwrap();
+        // ownership id is HMAC(spk); recompute with the vector's spk — equal ids
+        // prove the derived spk matched the BIP-86 vector byte-for-byte.
+        let mut spk = hex("5120a60869f0dbcf1dc659c9cecbaf8050135ea9e8cdc487053f1dc6880949dc684c");
+        assert_eq!(&proof[6..38], &ownership_id(&seed, &spk)[..]);
+        // and the witness is a single 64-byte schnorr signature
+        assert_eq!(&proof[38..41], &[0x00, 0x01, 0x40]);
+        assert_eq!(proof.len(), 41 + 64);
+
+        // Round-trip: the signature verifies against the tweaked output key over
+        // the recomputed SLIP-0019 digest.
+        use ngwallet::bdk_wallet::bitcoin::secp256k1::schnorr::Signature;
+        let mut preimage = proof[..38].to_vec();
+        push_varint(spk.len() as u64, &mut preimage);
+        preimage.append(&mut spk);
+        push_varint(0, &mut preimage);
+        let digest = sha256::Hash::hash(&preimage);
+        let xonly = XOnlyPublicKey::from_slice(&hex(
+            "a60869f0dbcf1dc659c9cecbaf8050135ea9e8cdc487053f1dc6880949dc684c",
+        ))
+        .unwrap();
+        let sig = Signature::from_slice(&proof[41..]).unwrap();
+        secp.verify_schnorr(&sig, &Message::from_digest(digest.to_byte_array()), &xonly)
+            .unwrap();
     }
 
     #[test]

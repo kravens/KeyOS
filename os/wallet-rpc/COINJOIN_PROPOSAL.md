@@ -178,30 +178,3 @@ support-url   = "https://coinjoin.nl/"
 The logic behind these permissions is the tested `wallet-rpc-core` typed API
 (`authorize`, `ownership_proof`, `sign_round`, `revoke`) — transport-independent,
 so a QuantumLink message handler calls it directly.
-
-## Appendix — proposed `app-config.toml` (SDK app form)
-
-If built as a QuantumLink SDK app (per docs.foundation.xyz/developers), this is
-the intended app identity and permission set. The permission set is smaller than
-the system-service version: no `os/usbdev` (QuantumLink replaces USB), just seed
-access, the two proposed coinjoin messages, and the approval UI.
-
-```toml
-app-name          = "coinjoin-signer"
-friendly-app-name = "Coinjoin Signer"
-launcher-app-name = "Coinjoin"
-description       = "Unattended WabiSabi coinjoin signer for Wasabi Wallet"
-icon              = "resources/icon.svg"
-app-id            = "0xab896a3044253d9da49f1bcc6499aaf9"
-version           = "0.1.0"
-min-keyos-version = "1.2.1"
-signing-identity  = "coinjoin.nl"          # dev cert via `foundation cert gen`
-
-[publisher]
-name          = "coinjoin.nl"
-contact-email = "<publisher email>"
-support-url   = "https://coinjoin.nl/"
-
-[permissions]
-# Seed access — retrieved once per session at authorization (trusted-display
-# confirm), cached for the session so rounds dont

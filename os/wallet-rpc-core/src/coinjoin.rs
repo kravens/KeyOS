@@ -26,6 +26,8 @@ use zeroize::Zeroizing;
 
 /// Purpose level of the BIP-84 account the policy covers.
 const PURPOSE: u32 = 84;
+/// BIP-86 taproot purpose — proofs only for now; round signing stays segwit v0.
+const PURPOSE_TR: u32 = 86;
 const HARDENED: u32 = 0x8000_0000;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -102,12 +104,14 @@ impl Policy {
         [PURPOSE | HARDENED, self.coin_type() | HARDENED, self.account | HARDENED]
     }
 
-    /// A derivation path is in scope iff it is exactly `prefix/change/index`
-    /// with change ∈ {0, 1}.
+    /// A derivation path is in scope iff it is exactly
+    /// `purpose'/coin'/account'/change/index` with the policy's coin + account,
+    /// purpose 84' (segwit v0) or 86' (taproot), and change ∈ {0, 1}.
     pub fn path_in_scope(&self, path: &[u32]) -> bool {
         let prefix = self.account_prefix();
         path.len() == 5
-            && path[..3] == prefix
+            && (path[0] == (PURPOSE | HARDENED) || path[0] == (PURPOSE_TR | HARDENED))
+            && path[1..3] == prefix[1..3]
             && (path[3] == 0 || path[3] == 1)
             && path[4] < HARDENED
     }

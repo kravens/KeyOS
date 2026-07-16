@@ -166,9 +166,23 @@ impl<B: Backend> Engine<B> {
         if !commitment_matches_coordinator(commitment, &session.policy.coordinator_id) {
             return Err(CoreError::Policy);
         }
+        // Script type follows the path's BIP purpose: 86' = taproot, else segwit v0.
+        let script_type = if path.first() == Some(&(86 | 0x8000_0000)) {
+            slip19::ScriptType::P2tr
+        } else {
+            slip19::ScriptType::P2wpkh
+        };
         // Uses the session's cached seed — no per-round trusted-display prompt.
-        slip19::ownership_proof(&self.secp, &session.seed, session.policy.network, path, commitment, true)
-            .map_err(|_| CoreError::Internal)
+        slip19::ownership_proof_for(
+            &self.secp,
+            &session.seed,
+            session.policy.network,
+            script_type,
+            path,
+            commitment,
+            true,
+        )
+        .map_err(|_| CoreError::Internal)
     }
 
     /// Verify the round PSBT against the session policy and sign our inputs.
@@ -420,6 +434,16 @@ mod tests {
         commitment.extend_from_slice(&[0xab; 32]);
         let proof = engine.ownership_proof(session, &[84 | H, H, H, 1, 0], &commitment).unwrap();
         assert_eq!(&proof[..4], &[0x53, 0x4c, 0x00, 0x19]);
+
+        // Taproot path (purpose 86') in the same account: P2TR proof — single
+        // 64-byte schnorr witness instead of the two-element P2WPKH stack.
+        let tr_proof =
+            engine.ownership_proof(session, &[86 | H, H, H, 1, 0], &commitment).unwrap();
+        assert_eq!(&tr_proof[..4], &[0x53, 0x4c, 0x00, 0x19]);
+        assert_eq!(&tr_proof[38..41], &[0x00, 0x01, 0x40]);
+        assert_eq!(tr_proof.len(), 41 + 64);
+        // Different script type, different ownership id.
+        assert_ne!(&tr_proof[6..38], &proof[6..38]);
 
         let mut evil = vec![4u8];
         evil.extend_from_slice(b"Evil");
