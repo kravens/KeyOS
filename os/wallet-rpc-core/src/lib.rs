@@ -12,3 +12,7 @@ pub mod coinjoin;
 pub mod frames;
 pub mod protocol;
 pub mod slip19;
+
+// Re-export for consumers that need the bitcoin types in our public API
+// (Network, bip39 Mnemonic, ...) without taking their own ngwallet dependency.
+pub use ngwallet;
