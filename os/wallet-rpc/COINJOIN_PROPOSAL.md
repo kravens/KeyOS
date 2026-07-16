@@ -126,10 +126,20 @@ QuantumLink messages, or the USB app capability when it ships — this logic sit
 behind it unchanged. The Wasabi side is implemented too (currently a USB client;
 would become a desktop QuantumLink client).
 
+## Ready-to-apply patch
+
+[`foundation-api-coinjoin.patch`](foundation-api-coinjoin.patch) (in this
+directory) is the concrete `foundation-api` change: the four messages in
+`api/src/api/bitcoin.rs` (`AuthorizeCoinjoinRequest/Response`,
+`GetOwnershipProofRequest/Response`), enum tags 37–40 in
+`QuantumLinkMessage`, and golden/roundtrip tests. Applies to the
+`add-chunk-offset` branch; 63/63 tests pass, existing snapshots untouched.
+
 ## Questions for you
 
 1. Would you add `AuthorizeCoinjoin` + `GetOwnershipProof` to
-   `foundation_api` / QuantumLink? We're happy to open a PR against KeyOS.
+   `foundation_api` / QuantumLink? The patch above is our proposed shape —
+   happy to open it as a PR.
 2. Is there a **desktop QuantumLink client** (Rust/C#) we can use from Wasabi, or
    is QuantumLink currently Envoy/mobile-only? *(This is our biggest open unknown.)*
 3. Does the **session-cached-seed** approach satisfy your seed-handling rules, or

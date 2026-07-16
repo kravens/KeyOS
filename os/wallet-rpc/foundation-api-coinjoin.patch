@@ -1,0 +1,252 @@
+From d2c73ac0d624347200aa322328c5eb76da055e05 Mon Sep 17 00:00:00 2001
+From: Kevin Ravensberg <kevinravensberg@proton.me>
+Date: Thu, 16 Jul 2026 20:15:14 +0200
+Subject: [PATCH] quantum-link: coinjoin session messages (AuthorizeCoinjoin,
+ GetOwnershipProof)
+
+Adds the two messages a WabiSabi coinjoin remote signer needs beyond the
+existing SignPsbt:
+
+- AuthorizeCoinjoinRequest/Response: a one-time session policy (coordinator
+  binding, per-round fee cap, round budget, expiry) the user approves on the
+  trusted display. Approval returns a session id; sessions are RAM-only on
+  the device.
+- GetOwnershipProofRequest/Response: a SLIP-0019 ownership proof for one
+  input under an authorized session. BIP-322-style signature over the
+  coordinator commitment, so SignPsbt cannot express it.
+
+Round signing itself reuses SignPsbt, policy-checked device-side under the
+same session. Reference device implementation (policy checks, SLIP-0019
+segwit + taproot proofs, session cache) is transport-agnostic and tested:
+https://github.com/kravens/KeyOS/tree/feature/passport-coinjoin (os/wallet-rpc-core)
+
+Golden tests included; existing snapshots untouched (enum tags 37-40).
+---
+ api/src/api/bitcoin.rs                        | 68 +++++++++++++++++++
+ api/src/api/message.rs                        |  9 +++
+ api/tests/golden_tests.rs                     | 56 +++++++++++++++
+ ...ts__golden_authorize_coinjoin_request.snap |  5 ++
+ ..._authorize_coinjoin_response_approved.snap |  5 ++
+ ...en_authorize_coinjoin_response_denied.snap |  5 ++
+ ...s__golden_get_ownership_proof_request.snap |  5 ++
+ ...__golden_get_ownership_proof_response.snap |  5 ++
+ 8 files changed, 158 insertions(+)
+ create mode 100644 api/tests/snapshots/golden_tests__golden_authorize_coinjoin_request.snap
+ create mode 100644 api/tests/snapshots/golden_tests__golden_authorize_coinjoin_response_approved.snap
+ create mode 100644 api/tests/snapshots/golden_tests__golden_authorize_coinjoin_response_denied.snap
+ create mode 100644 api/tests/snapshots/golden_tests__golden_get_ownership_proof_request.snap
+ create mode 100644 api/tests/snapshots/golden_tests__golden_get_ownership_proof_response.snap
+
+diff --git a/api/src/api/bitcoin.rs b/api/src/api/bitcoin.rs
+index 821f280..d89a484 100644
+--- a/api/src/api/bitcoin.rs
++++ b/api/src/api/bitcoin.rs
+@@ -30,3 +30,71 @@ pub struct ApplyPassphrase {
+     #[n(0)]
+     pub fingerprint: Option<String>,
+ }
++
++// Coinjoin remote signing (WabiSabi). One on-device policy approval opens a
++// session; conforming rounds then get SLIP-0019 ownership proofs and PSBT
++// signatures (the latter via the existing SignPsbt) without further prompts.
++// Non-conforming requests are rejected, never escalated to the user.
++
++/// Ask the device to authorize a coinjoin session. The device shows the policy
++/// on the trusted display; the user approves or denies there.
++#[quantum_link]
++pub struct AuthorizeCoinjoinRequest {
++    #[n(0)]
++    pub account_id: String,
++    /// Coordinator identifier; ownership proofs are bound to it (proofs are
++    /// only produced for commitment data opening with this identifier).
++    #[n(1)]
++    pub coordinator_id: String,
++    /// Maximum sats the wallet may lose per round (mining fee share +
++    /// coordination fee): sum(our inputs) - sum(our outputs), per round.
++    #[n(2)]
++    pub max_fee_contribution_sats: u64,
++    /// Round budget: the session stops signing after this many rounds.
++    #[n(3)]
++    pub max_rounds: u16,
++    /// Session lifetime in seconds from approval.
++    #[n(4)]
++    pub valid_for_seconds: u32,
++}
++
++#[quantum_link]
++pub struct AuthorizeCoinjoinResponse {
++    #[n(0)]
++    pub account_id: String,
++    /// The authorized session id, or None if the user denied the policy.
++    /// Sessions are RAM-only on the device and end at max_rounds, expiry,
++    /// reboot, or an explicit denial of a later request.
++    #[n(1)]
++    pub session_id: Option<u32>,
++}
++
++/// Request a SLIP-0019 ownership proof for one input under an authorized
++/// session. This is a BIP-322-style proof over the coordinator's commitment
++/// data — not a PSBT signature, which is why SignPsbt cannot express it.
++#[quantum_link]
++pub struct GetOwnershipProofRequest {
++    #[n(0)]
++    pub account_id: String,
++    #[n(1)]
++    pub session_id: u32,
++    /// BIP-32 derivation path of the input's key (hardened = high bit set).
++    #[n(2)]
++    pub derivation_path: Vec<u32>,
++    /// The coordinator's commitment data; must open with the session's
++    /// authorized coordinator_id or the device refuses.
++    #[n(3)]
++    pub commitment_data: Vec<u8>,
++}
++
++#[quantum_link]
++pub struct GetOwnershipProofResponse {
++    #[n(0)]
++    pub account_id: String,
++    #[n(1)]
++    pub session_id: u32,
++    /// The serialized SLIP-0019 proof, or None if the request was outside the
++    /// session policy (wrong coordinator, path out of scope, session expired).
++    #[n(2)]
++    pub proof: Option<Vec<u8>>,
++}
+diff --git a/api/src/api/message.rs b/api/src/api/message.rs
+index 613dd5a..8b01b90 100644
+--- a/api/src/api/message.rs
++++ b/api/src/api/message.rs
+@@ -132,4 +132,13 @@ pub enum QuantumLinkMessage {
+     UnpairingRequest(UnpairingRequest),
+     #[n(36)]
+     UnpairingResponse(UnpairingResponse),
++
++    #[n(37)]
++    AuthorizeCoinjoinRequest(AuthorizeCoinjoinRequest),
++    #[n(38)]
++    AuthorizeCoinjoinResponse(AuthorizeCoinjoinResponse),
++    #[n(39)]
++    GetOwnershipProofRequest(GetOwnershipProofRequest),
++    #[n(40)]
++    GetOwnershipProofResponse(GetOwnershipProofResponse),
+ }
+diff --git a/api/tests/golden_tests.rs b/api/tests/golden_tests.rs
+index e5eefa3..1a754c0 100644
+--- a/api/tests/golden_tests.rs
++++ b/api/tests/golden_tests.rs
+@@ -545,3 +545,59 @@ fn golden_restore_magic_backup_result_error() {
+ fn golden_heartbeat() {
+     assert_golden!(QuantumLinkMessage::Heartbeat(Heartbeat {}))
+ }
++
++#[test]
++fn golden_authorize_coinjoin_request() {
++    assert_golden!(QuantumLinkMessage::AuthorizeCoinjoinRequest(
++        AuthorizeCoinjoinRequest {
++            account_id: "account-1".to_string(),
++            coordinator_id: "coinjoin.nl".to_string(),
++            max_fee_contribution_sats: 1000,
++            max_rounds: 10,
++            valid_for_seconds: 43200,
++        },
++    ));
++}
++
++#[test]
++fn golden_authorize_coinjoin_response_approved() {
++    assert_golden!(QuantumLinkMessage::AuthorizeCoinjoinResponse(
++        AuthorizeCoinjoinResponse {
++            account_id: "account-1".to_string(),
++            session_id: Some(1),
++        },
++    ));
++}
++
++#[test]
++fn golden_authorize_coinjoin_response_denied() {
++    assert_golden!(QuantumLinkMessage::AuthorizeCoinjoinResponse(
++        AuthorizeCoinjoinResponse {
++            account_id: "account-1".to_string(),
++            session_id: None,
++        },
++    ));
++}
++
++#[test]
++fn golden_get_ownership_proof_request() {
++    assert_golden!(QuantumLinkMessage::GetOwnershipProofRequest(
++        GetOwnershipProofRequest {
++            account_id: "account-1".to_string(),
++            session_id: 1,
++            derivation_path: vec![0x80000054, 0x80000000, 0x80000000, 1, 0],
++            commitment_data: vec![0x0b, 0x63, 0x6f, 0x69, 0x6e, 0x6a, 0x6f, 0x69, 0x6e, 0x2e, 0x6e, 0x6c],
++        },
++    ));
++}
++
++#[test]
++fn golden_get_ownership_proof_response() {
++    assert_golden!(QuantumLinkMessage::GetOwnershipProofResponse(
++        GetOwnershipProofResponse {
++            account_id: "account-1".to_string(),
++            session_id: 1,
++            proof: Some(vec![0x53, 0x4c, 0x00, 0x19]),
++        },
++    ));
++}
+diff --git a/api/tests/snapshots/golden_tests__golden_authorize_coinjoin_request.snap b/api/tests/snapshots/golden_tests__golden_authorize_coinjoin_request.snap
+new file mode 100644
+index 0000000..cc8dfb5
+--- /dev/null
++++ b/api/tests/snapshots/golden_tests__golden_authorize_coinjoin_request.snap
+@@ -0,0 +1,5 @@
++---
++source: api/tests/golden_tests.rs
++expression: hex.clone()
++---
++821825a500696163636f756e742d31016b636f696e6a6f696e2e6e6c021903e8030a0419a8c0
+diff --git a/api/tests/snapshots/golden_tests__golden_authorize_coinjoin_response_approved.snap b/api/tests/snapshots/golden_tests__golden_authorize_coinjoin_response_approved.snap
+new file mode 100644
+index 0000000..110473e
+--- /dev/null
++++ b/api/tests/snapshots/golden_tests__golden_authorize_coinjoin_response_approved.snap
+@@ -0,0 +1,5 @@
++---
++source: api/tests/golden_tests.rs
++expression: hex.clone()
++---
++821826a200696163636f756e742d310101
+diff --git a/api/tests/snapshots/golden_tests__golden_authorize_coinjoin_response_denied.snap b/api/tests/snapshots/golden_tests__golden_authorize_coinjoin_response_denied.snap
+new file mode 100644
+index 0000000..5628a3d
+--- /dev/null
++++ b/api/tests/snapshots/golden_tests__golden_authorize_coinjoin_response_denied.snap
+@@ -0,0 +1,5 @@
++---
++source: api/tests/golden_tests.rs
++expression: hex.clone()
++---
++821826a100696163636f756e742d31
+diff --git a/api/tests/snapshots/golden_tests__golden_get_ownership_proof_request.snap b/api/tests/snapshots/golden_tests__golden_get_ownership_proof_request.snap
+new file mode 100644
+index 0000000..62fa2e4
+--- /dev/null
++++ b/api/tests/snapshots/golden_tests__golden_get_ownership_proof_request.snap
+@@ -0,0 +1,5 @@
++---
++source: api/tests/golden_tests.rs
++expression: hex.clone()
++---
++821827a400696163636f756e742d31010102851a800000541a800000001a800000000100034c0b636f696e6a6f696e2e6e6c
+diff --git a/api/tests/snapshots/golden_tests__golden_get_ownership_proof_response.snap b/api/tests/snapshots/golden_tests__golden_get_ownership_proof_response.snap
+new file mode 100644
+index 0000000..039c8ca
+--- /dev/null
++++ b/api/tests/snapshots/golden_tests__golden_get_ownership_proof_response.snap
+@@ -0,0 +1,5 @@
++---
++source: api/tests/golden_tests.rs
++expression: hex.clone()
++---
++821828a300696163636f756e742d3101010244534c0019
