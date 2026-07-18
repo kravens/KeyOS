@@ -1,5 +1,5 @@
-// SPDX-FileCopyrightText: 2026 Foundation Devices, Inc. <hello@foundation.xyz>
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-FileCopyrightText: 2026 Kevin Ravensberg <kevinravensberg@proton.me>
+// SPDX-License-Identifier: MIT OR GPL-3.0-or-later
 
 //! Host-independent coinjoin remote-signing core for Passport Prime.
 //!
