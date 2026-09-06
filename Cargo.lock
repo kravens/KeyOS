@@ -12356,6 +12356,7 @@ dependencies = [
  "wallet-rpc-core",
  "xous",
  "xous-api-log",
+ "zeroize",
 ]
 
 [[package]]
@@ -12379,6 +12380,7 @@ dependencies = [
  "wallet-rpc-core",
  "xous-api-log",
  "xous-ipc",
+ "zeroize",
 ]
 
 [[package]]

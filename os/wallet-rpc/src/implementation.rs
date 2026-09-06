@@ -188,7 +188,7 @@ impl KeyOsBackend {
 impl Backend for KeyOsBackend {
     fn firmware_version(&self) -> String { env!("CARGO_PKG_VERSION").to_string() }
 
-    fn seed(&mut self) -> Option<Vec<u8>> {
+    fn seed(&mut self) -> Option<zeroize::Zeroizing<Vec<u8>>> {
         let entropy = match self.security.seed() {
             Ok(Some(seed)) => seed,
             Ok(None) => {
@@ -211,7 +211,24 @@ impl Backend for KeyOsBackend {
         )
         .inspect_err(|e| log::error!("Master key derivation failed: {e:?}"))
         .ok()?;
-        Some(master.key.0.to_vec())
+        Some(zeroize::Zeroizing::new(master.key.0.to_vec()))
+    }
+
+    fn random_bytes(&mut self, out: &mut [u8]) -> bool {
+        match self.security.get_random() {
+            Ok(random) if random.len() >= out.len() => {
+                out.copy_from_slice(&random[..out.len()]);
+                true
+            }
+            Ok(_) => {
+                log::error!("Secure random too short for a session token");
+                false
+            }
+            Err(e) => {
+                log::error!("Secure random unavailable: {e:?}");
+                false
+            }
+        }
     }
 
     #[cfg(not(feature = "gui-approval"))]
@@ -234,8 +251,8 @@ impl Backend for KeyOsBackend {
             },
         );
         let line2 = format!(
-            "Max fee: {} sats/round\nRounds: up to {}, valid {} min",
-            policy.max_fee_contribution,
+            "Fee budget: {} sats total\nRounds: up to {}, valid {} min",
+            policy.fee_budget_sats,
             policy.max_rounds,
             policy.valid_for_secs / 60,
         );

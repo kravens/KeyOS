@@ -27,6 +27,7 @@ thiserror = "1.0"
 usb = { workspace = true, optional = true }
 wallet-rpc-core = { path = "../wallet-rpc-core" }
 xous = { path = "../../xous/xous-rs" }
+zeroize = "1"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(keyos)'] }

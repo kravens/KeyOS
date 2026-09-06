@@ -16,3 +16,4 @@ security = { workspace = true }
 server = { workspace = true }
 wallet-rpc-core = { path = "../../os/wallet-rpc-core" }
 xous-ipc = { workspace = true }
+zeroize = "1"

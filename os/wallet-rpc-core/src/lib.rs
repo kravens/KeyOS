@@ -3,16 +3,19 @@
 
 //! Host-independent coinjoin remote-signing core for Passport Prime.
 //!
-//! Everything here is functional over its inputs (seeds, policies, PSBTs, byte
-//! frames) with no KeyOS server, USB, or GUI dependency. The `wallet-rpc`
-//! server crate wraps this with the USB HID transport, the security-server seed
-//! source, and the on-device approval UI.
+//! Everything here is functional over its inputs (keys, policies, PSBTs, byte
+//! frames) with no KeyOS server, USB, or GUI dependency: the Coinjoin Signer
+//! app wraps it with the `os/security` seed source and the on-device approval
+//! UI, the KeyOS `wallet-rpc` server crate wraps the same code with a USB HID
+//! transport, and the hosted tests drive it directly.
 
 pub mod coinjoin;
 pub mod frames;
 pub mod protocol;
 pub mod slip19;
 
-// Re-export for consumers that need the bitcoin types in our public API
-// (Network, bip39 Mnemonic, ...) without taking their own ngwallet dependency.
+// Re-exports so consumers don't need to pin these dependencies themselves:
+// bitcoin types surface in our public API (Network, bip39, Psbt, ...) and
+// `Zeroizing` is part of the `Backend::seed` contract.
 pub use ngwallet;
+pub use zeroize;

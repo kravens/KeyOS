@@ -7,7 +7,7 @@ en = "Wallet RPC Server"
 ProcessRpcFrame = { id = 0, type = "archive" }
 
 [permissions]
-"os/security" = ["GetSeed"]
+"os/security" = ["GetSeed", "GetRandom"]
 "os/gui-server" = ["ShowModal"]
 "os/usbdev" = [
     "ReadEndpoint",

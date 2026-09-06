@@ -14,14 +14,19 @@
 //! P2TR key-spends with the BIP-86 tweaked key (witness `[64-byte schnorr]`,
 //! SIGHASH_DEFAULT so no trailing sighash byte).
 //!
-//! Purely functional: seed in, proof out. No KeyOS server dependencies.
+//! Two entry points: the `*_with_key` functions take the SLIP-0021 ownership
+//! node plus an already-derived key, which is what a live session uses (the
+//! seed is derived once at authorization and dropped); the seed-taking wrappers
+//! stay because the SLIP-0019 spec vectors are stated in terms of a seed.
+//!
+//! Purely functional: keys in, proof out. No KeyOS server dependencies.
 
 use ngwallet::bdk_wallet::bitcoin::{
     bip32::{ChildNumber, DerivationPath, Xpriv},
     hashes::{hmac::HmacEngine, sha256, sha512, Hash, HashEngine, Hmac},
     key::{Keypair, TapTweak, XOnlyPublicKey},
     secp256k1::{All, Message, Secp256k1},
-    CompressedPublicKey, Network,
+    CompressedPublicKey, Network, ScriptBuf,
 };
 
 /// Script type of the input a proof is requested for.
@@ -31,6 +36,21 @@ pub enum ScriptType {
     P2wpkh,
     /// Taproot key-spend with the BIP-86 tweak (BIP-86 keys).
     P2tr,
+}
+
+/// BIP-43 purpose of a taproot (BIP-86) account, hardened.
+pub const PURPOSE_TR: u32 = 86 | 0x8000_0000;
+
+impl ScriptType {
+    /// The script type a BIP-43 purpose implies: 86' is taproot, anything else
+    /// in policy scope is segwit v0.
+    pub fn for_purpose(purpose: u32) -> Self {
+        if purpose == PURPOSE_TR {
+            ScriptType::P2tr
+        } else {
+            ScriptType::P2wpkh
+        }
+    }
 }
 
 pub const FLAG_USER_CONFIRMATION: u8 = 0x01;
@@ -87,15 +107,41 @@ fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
     Hmac::<sha256::Hash>::from_engine(engine).to_byte_array()
 }
 
+/// The SLIP-0019 ownership identification key of a seed: SLIP-0021 node
+/// `m/"SLIP-0019"/"Ownership identification key"`. Derived once per session so
+/// proofs never need the seed again.
+pub fn ownership_key(seed: &[u8]) -> [u8; 32] {
+    slip21_key(seed, &[b"SLIP-0019", b"Ownership identification key"])
+}
+
 /// The device's ownership id for a scriptPubKey (SLIP-0019 § Ownership identifier).
 pub fn ownership_id(seed: &[u8], script_pubkey: &[u8]) -> [u8; 32] {
-    let key = slip21_key(seed, &[b"SLIP-0019", b"Ownership identification key"]);
-    hmac_sha256(&key, script_pubkey)
+    ownership_id_with_key(&ownership_key(seed), script_pubkey)
+}
+
+/// Ownership id from an already-derived ownership key.
+pub fn ownership_id_with_key(key: &[u8; 32], script_pubkey: &[u8]) -> [u8; 32] {
+    hmac_sha256(key, script_pubkey)
+}
+
+/// scriptPubKey the key at `xpriv` pays to under `script_type`. Taproot uses
+/// the BIP-86 tweak (no script tree), matching what Wasabi derives host-side.
+pub fn script_pubkey(secp: &Secp256k1<All>, xpriv: &Xpriv, script_type: ScriptType) -> ScriptBuf {
+    match script_type {
+        ScriptType::P2wpkh => {
+            let pubkey = CompressedPublicKey(xpriv.private_key.public_key(secp));
+            ScriptBuf::new_p2wpkh(&pubkey.wpubkey_hash())
+        }
+        ScriptType::P2tr => {
+            let keypair = Keypair::from_secret_key(secp, &xpriv.private_key);
+            let (internal, _) = XOnlyPublicKey::from_keypair(&keypair);
+            ScriptBuf::new_p2tr(secp, internal, None)
+        }
+    }
 }
 
 /// Generate a SLIP-0019 ownership proof for the P2WPKH key at `path`.
-/// (Kept for existing callers; equivalent to [`ownership_proof_for`] with
-/// [`ScriptType::P2wpkh`].)
+/// (Spec-vector wrapper; live sessions use [`ownership_proof_with_key`].)
 pub fn ownership_proof(
     secp: &Secp256k1<All>,
     seed: &[u8],
@@ -115,7 +161,7 @@ pub fn ownership_proof(
     )
 }
 
-/// Generate a SLIP-0019 ownership proof for the key at `path`.
+/// Generate a SLIP-0019 ownership proof for the key at `path`, from a seed.
 #[allow(clippy::too_many_arguments)]
 pub fn ownership_proof_for(
     secp: &Secp256k1<All>,
@@ -129,41 +175,40 @@ pub fn ownership_proof_for(
     let derivation: DerivationPath =
         path.iter().map(|&i| ChildNumber::from(i)).collect::<Vec<_>>().into();
     let xpriv = Xpriv::new_master(network, seed)?.derive_priv(secp, &derivation)?;
+    Ok(ownership_proof_with_key(
+        secp,
+        &ownership_key(seed),
+        &xpriv,
+        script_type,
+        commitment_data,
+        user_confirmation,
+    ))
+}
 
-    let spk = match script_type {
-        ScriptType::P2wpkh => {
-            // P2WPKH scriptPubKey: OP_0 PUSH20 <hash160(pubkey)>
-            let pubkey = CompressedPublicKey(xpriv.private_key.public_key(secp));
-            let mut spk = Vec::with_capacity(22);
-            spk.push(0x00);
-            spk.push(0x14);
-            spk.extend_from_slice(pubkey.wpubkey_hash().as_byte_array());
-            spk
-        }
-        ScriptType::P2tr => {
-            // P2TR scriptPubKey: OP_1 PUSH32 <xonly(BIP-86 tweaked key)>
-            let keypair = Keypair::from_secret_key(secp, &xpriv.private_key);
-            let (tweaked_xonly, _) =
-                XOnlyPublicKey::from_keypair(&keypair.tap_tweak(secp, None).to_keypair());
-            let mut spk = Vec::with_capacity(34);
-            spk.push(0x51);
-            spk.push(0x20);
-            spk.extend_from_slice(&tweaked_xonly.serialize());
-            spk
-        }
-    };
+/// Generate a SLIP-0019 ownership proof from session key material: the
+/// SLIP-0021 ownership node and the already-derived key for the address.
+pub fn ownership_proof_with_key(
+    secp: &Secp256k1<All>,
+    ownership_key: &[u8; 32],
+    xpriv: &Xpriv,
+    script_type: ScriptType,
+    commitment_data: &[u8],
+    user_confirmation: bool,
+) -> Vec<u8> {
+    let script = script_pubkey(secp, xpriv, script_type);
+    let spk = script.as_bytes();
 
     // Proof body
     let mut proof = Vec::new();
     proof.extend_from_slice(&VERSION_MAGIC);
     proof.push(if user_confirmation { FLAG_USER_CONFIRMATION } else { 0 });
     push_varint(1, &mut proof);
-    proof.extend_from_slice(&ownership_id(seed, &spk));
+    proof.extend_from_slice(&ownership_id_with_key(ownership_key, spk));
 
     // Sighash = SHA256(proofBody || proofFooter)
     let mut preimage = proof.clone();
     push_varint(spk.len() as u64, &mut preimage);
-    preimage.extend_from_slice(&spk);
+    preimage.extend_from_slice(spk);
     push_varint(commitment_data.len() as u64, &mut preimage);
     preimage.extend_from_slice(commitment_data);
     let sighash = sha256::Hash::hash(&preimage);
@@ -195,7 +240,7 @@ pub fn ownership_proof_for(
         }
     }
 
-    Ok(proof)
+    proof
 }
 
 #[cfg(test)]
@@ -244,6 +289,43 @@ mod tests {
                  18c8f6aaa0adec0199c69901f0db7d3485eb38d9ad235221dc3d61154b"
             ),
         );
+    }
+
+    /// The session path (cached ownership node + derived key) must produce the
+    /// exact same proof as the seed path — that equality is what lets the device
+    /// drop the seed after authorization.
+    #[test]
+    fn key_path_matches_seed_path() {
+        let secp = Secp256k1::new();
+        let seed = test_seed();
+        let from_seed = ownership_proof(
+            &secp,
+            &seed,
+            Network::Bitcoin,
+            &[84 | H, H, H, 1, 0],
+            b"commitment",
+            true,
+        )
+        .unwrap();
+
+        let derivation: DerivationPath = [84 | H, H, H, 1u32, 0]
+            .iter()
+            .map(|&i| ChildNumber::from(i))
+            .collect::<Vec<_>>()
+            .into();
+        let xpriv = Xpriv::new_master(Network::Bitcoin, &seed)
+            .unwrap()
+            .derive_priv(&secp, &derivation)
+            .unwrap();
+        let from_keys = ownership_proof_with_key(
+            &secp,
+            &ownership_key(&seed),
+            &xpriv,
+            ScriptType::P2wpkh,
+            b"commitment",
+            true,
+        );
+        assert_eq!(from_seed, from_keys);
     }
 
     #[test]
